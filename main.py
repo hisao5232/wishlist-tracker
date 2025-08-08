@@ -3,107 +3,111 @@ import sqlite3
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from datetime import datetime
+from linebot import LineBotApi
+from linebot.models import TextSendMessage
 
-# .env を読み込み
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-dotenv_path = os.path.join(BASE_DIR, ".env")
-load_dotenv(dotenv_path)
+load_dotenv()
 
-# 環境変数取得
-WISHLIST_URL = os.getenv("WISHLIST_URL")
-LINE_TOKEN = os.getenv("LINE_TOKEN")
+WISHLIST_URL = os.getenv("AMAZON_WISHLIST_URL")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wishlist.db")
 
-if not WISHLIST_URL or not LINE_TOKEN:
-    raise ValueError(".env に WISHLIST_URL と LINE_TOKEN を設定してください")
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 
-# データベース設定
-DB_PATH = os.path.join(BASE_DIR, "wishlist.db")
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36",
+    "Accept-Language": "ja-JP,ja;q=0.9"
+}
 
-# LINE通知関数
-def send_line_notify(message: str):
-    url = "https://notify-api.line.me/api/notify"
-    headers = {"Authorization": f"Bearer {LINE_TOKEN}"}
-    payload = {"message": message}
-    requests.post(url, headers=headers, data=payload)
+def create_table():
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS wishlist (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                price INTEGER
+            )
+        """)
+        conn.commit()
 
-# スクレイピング関数
-def scrape_wishlist():
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/115.0.0.0 Safari/537.36"
-        )
-    }
-    response = requests.get(WISHLIST_URL, headers=headers)
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "lxml")
+def fetch_wishlist():
+    res = requests.get(WISHLIST_URL, headers=HEADERS)
+    res.raise_for_status()
+    soup = BeautifulSoup(res.text, "html.parser")
     items = []
 
-    for item in soup.select(".g-item-sortable"):
-        title_elem = item.select_one(".a-text-normal")
-        price_elem = item.select_one(".a-price .a-offscreen")
+    # ここはAmazonの欲しいものリストの構造によって調整が必要です
+    for item_div in soup.select("div.g-item-sortable"):
+        # 商品ID取得（ASINなど）
+        link = item_div.select_one("a.a-link-normal")
+        if not link:
+            continue
+        href = link.get("href", "")
+        asin = None
+        if "dp/" in href:
+            asin = href.split("dp/")[1].split("/")[0]
+        if not asin:
+            continue
 
-        if title_elem and price_elem:
-            title = title_elem.get_text(strip=True)
-            price_text = price_elem.get_text(strip=True).replace("￥", "").replace(",", "")
+        # 商品名
+        name_tag = item_div.select_one("a.a-link-normal")
+        name = name_tag.text.strip() if name_tag else "名前不明"
+
+        # 価格
+        price_tag = item_div.select_one("span.a-price > span.a-offscreen")
+        if price_tag:
+            price_str = price_tag.text.strip().replace("￥", "").replace(",", "")
             try:
-                price = int(price_text)
-            except ValueError:
-                continue
-            items.append((title, price))
+                price = int(price_str)
+            except:
+                price = None
+        else:
+            price = None
+
+        items.append({"id": asin, "name": name, "price": price})
 
     return items
 
-# データベース初期化
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS wishlist (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            price INTEGER NOT NULL,
-            last_updated TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
+def check_and_notify():
+    create_table()
+    items = fetch_wishlist()
 
-# 価格比較と更新
-def check_and_update_prices(items):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
 
-    for title, price in items:
-        c.execute("SELECT price FROM wishlist WHERE title = ?", (title,))
-        row = c.fetchone()
-        if row:
-            old_price = row[0]
-            if old_price != price:
-                send_line_notify(
-                    f"📢 Amazon欲しい物リスト価格変動\n"
-                    f"{title}\n"
-                    f"前回: ￥{old_price:,}\n"
-                    f"今回: ￥{price:,}"
-                )
-                c.execute(
-                    "UPDATE wishlist SET price = ?, last_updated = ? WHERE title = ?",
-                    (price, datetime.now().isoformat(), title)
-                )
-        else:
-            c.execute(
-                "INSERT INTO wishlist (title, price, last_updated) VALUES (?, ?, ?)",
-                (title, price, datetime.now().isoformat())
-            )
+        messages = []
+        for item in items:
+            c.execute("SELECT price FROM wishlist WHERE id=?", (item["id"],))
+            row = c.fetchone()
+            old_price = row[0] if row else None
+            new_price = item["price"]
 
-    conn.commit()
-    conn.close()
+            if new_price is None:
+                # 価格情報がない場合はスキップ
+                continue
 
-# メイン処理
+            if old_price is None:
+                # 初回登録
+                c.execute("INSERT OR REPLACE INTO wishlist (id, name, price) VALUES (?, ?, ?)",
+                          (item["id"], item["name"], new_price))
+            elif old_price != new_price:
+                # 価格変動検知
+                msg = f"【価格変動】\n{item['name']}\n前回: ￥{old_price}\n今回: ￥{new_price}"
+                messages.append(msg)
+                c.execute("UPDATE wishlist SET price=? WHERE id=?", (new_price, item["id"]))
+
+        conn.commit()
+
+    if messages:
+        text = "\n\n".join(messages)
+        try:
+            line_bot_api.broadcast(TextSendMessage(text=text))
+            print("通知送信完了")
+        except Exception as e:
+            print("通知送信エラー:", e)
+    else:
+        print("価格変動なし")
+
 if __name__ == "__main__":
-    init_db()
-    items = scrape_wishlist()
-    check_and_update_prices(items)
+    check_and_notify()
